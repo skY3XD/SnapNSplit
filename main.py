@@ -1,7 +1,12 @@
 """
-Receipt Split Telegram Bot
+Receipt Split Telegram Bot (@snapnsplit_bot)
 Uses python-telegram-bot v20+ and Google Gemini for receipt OCR.
-Default language: EN | Default currency: PLN
+Default language: EN | Default currency: EUR
+
+- Currencies: EUR, USD, PLN, UAH, RUB, MNT (rates relative to EUR)
+- Photos are processed only on explicit request:
+  * Private: caption /split, ReplyKeyboard button, or /split mode
+  * Group: @snapnsplit_bot mention, /split in caption, or reply to bot message
 """
 
 import asyncio
@@ -15,8 +20,14 @@ from typing import Any
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -36,37 +47,61 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+BOT_USERNAME = "snapnsplit_bot"  # without @
 
 if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN and GEMINI_API_KEY in .env")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = "gemini-3.6-flash"
+
 # One active receipt per chat
 receipts: dict[int, dict[str, Any]] = {}
 
-# Fixed exchange rates relative to PLN (replace with live API if needed)
-RATES_TO_PLN: dict[str, float] = {
-    "PLN": 1.0,
-    "EUR": 4.30,
-    "USD": 3.95,
-    "UAH": 0.10,
+# Users who enabled "split mode" in private chats (next photo will be scanned)
+split_mode_users: set[int] = set()
+
+# Fixed exchange rates relative to EUR (replace with live API if needed)
+RATES_TO_EUR: dict[str, float] = {
+    "EUR": 1.0,
+    "USD": 0.86,      # ~1 USD ≈ 0.86 EUR
+    "PLN": 0.232,     # ~1 PLN ≈ 0.232 EUR
+    "UAH": 0.021,     # ~1 UAH ≈ 0.021 EUR
+    "RUB": 0.010,     # ~1 RUB ≈ 0.010 EUR
+    "MNT": 0.000244,  # ~1 MNT ≈ 0.000244 EUR
 }
-SUPPORTED_CURRENCIES = ("PLN", "EUR", "USD", "UAH")
+SUPPORTED_CURRENCIES = ("EUR", "USD", "PLN", "UAH", "RUB", "MNT")
 SUPPORTED_LANGS = ("EN", "PL", "UA", "RU")
 TIP_OPTIONS = (0, 5, 10, 15)
+DEFAULT_CURRENCY = "EUR"
+
+# Reply-keyboard labels for enabling split mode (private chats)
+SPLIT_MODE_BUTTONS = {
+    "EN": "📷 Split receipt",
+    "PL": "📷 Podziel rachunek",
+    "UA": "📷 Розділити чек",
+    "RU": "📷 Разделить чек",
+}
+SPLIT_MODE_BUTTON_SET = set(SPLIT_MODE_BUTTONS.values())
 
 TEXTS: dict[str, dict[str, str]] = {
     "EN": {
         "welcome": (
             "👋 *Receipt Split Bot*\n\n"
-            "Send a photo of a receipt and I'll help split the bill among friends.\n\n"
+            "Send a photo of a receipt with the caption `/split` "
+            "(or use the button below) and I'll help split the bill among friends.\n\n"
+            "In groups: mention @snapnsplit_bot, use `/split`, or reply to a bot message.\n\n"
             "Commands:\n"
             "/start — this message\n"
+            "/split — enable split mode for the next photo (private)\n"
             "/cancel — discard current receipt\n"
             "/help — help"
         ),
-        "help": "📷 Send a receipt photo to start splitting the bill.",
+        "help": (
+            "📷 To scan a receipt:\n"
+            "• Private: send photo with caption `/split`, press the button, or run /split then send photo\n"
+            "• Group: photo + @snapnsplit_bot, caption `/split`, or reply to a bot message"
+        ),
         "cancelled": "❌ Current receipt cancelled.",
         "no_receipt": "No active receipt. Send a photo first.",
         "processing": "🔍 Scanning receipt, please wait…",
@@ -98,17 +133,33 @@ TEXTS: dict[str, dict[str, str]] = {
         "choose_currency": "💵 Select currency:",
         "payer_not_set": "not set",
         "back": "⬅️ Back",
+        "split_mode_on": (
+            "📷 Split mode ON. Send a receipt photo now "
+            "(or send photo with caption `/split`)."
+        ),
+        "split_mode_off": "Split mode cancelled.",
+        "photo_ignored": (
+            "Photo ignored. To scan a receipt use `/split` in the caption, "
+            "the button below, or enable mode with /split."
+        ),
     },
     "PL": {
         "welcome": (
             "👋 *Bot do dzielenia rachunku*\n\n"
-            "Wyślij zdjęcie paragonu, a pomogę podzielić rachunek między znajomych.\n\n"
+            "Wyślij zdjęcie paragonu z podpisem `/split` "
+            "(lub użyj przycisku poniżej), a pomogę podzielić rachunek.\n\n"
+            "W grupach: wspomnij @snapnsplit_bot, użyj `/split` lub odpowiedz na wiadomość bota.\n\n"
             "Komendy:\n"
             "/start — ta wiadomość\n"
+            "/split — włącz tryb dzielenia na następne zdjęcie (prywatnie)\n"
             "/cancel — anuluj bieżący rachunek\n"
             "/help — pomoc"
         ),
-        "help": "📷 Wyślij zdjęcie paragonu, aby rozpocząć podział.",
+        "help": (
+            "📷 Aby zeskanować paragon:\n"
+            "• Prywatnie: zdjęcie z podpisem `/split`, przycisk lub /split, potem zdjęcie\n"
+            "• Grupa: zdjęcie + @snapnsplit_bot, podpis `/split` lub odpowiedź na wiadomość bota"
+        ),
         "cancelled": "❌ Bieżący rachunek anulowany.",
         "no_receipt": "Brak aktywnego rachunku. Najpierw wyślij zdjęcie.",
         "processing": "🔍 Skanowanie paragonu, proszę czekać…",
@@ -140,17 +191,33 @@ TEXTS: dict[str, dict[str, str]] = {
         "choose_currency": "💵 Wybierz walutę:",
         "payer_not_set": "nie ustawiono",
         "back": "⬅️ Wstecz",
+        "split_mode_on": (
+            "📷 Tryb dzielenia WŁĄCZONY. Wyślij teraz zdjęcie paragonu "
+            "(lub zdjęcie z podpisem `/split`)."
+        ),
+        "split_mode_off": "Tryb dzielenia wyłączony.",
+        "photo_ignored": (
+            "Zdjęcie zignorowane. Aby zeskanować paragon użyj `/split` w podpisie, "
+            "przycisku poniżej lub włącz tryb komendą /split."
+        ),
     },
     "UA": {
         "welcome": (
             "👋 *Бот для розділення чеку*\n\n"
-            "Надішліть фото чеку, і я допоможу розділити рахунок між друзями.\n\n"
+            "Надішліть фото чеку з підписом `/split` "
+            "(або скористайтесь кнопкою нижче), і я допоможу розділити рахунок.\n\n"
+            "У групах: згадайте @snapnsplit_bot, використайте `/split` або відповідайте на повідомлення бота.\n\n"
             "Команди:\n"
             "/start — це повідомлення\n"
+            "/split — увімкнути режим розділення для наступного фото (особисто)\n"
             "/cancel — скасувати поточний чек\n"
             "/help — довідка"
         ),
-        "help": "📷 Надішліть фото чеку, щоб почати розділення.",
+        "help": (
+            "📷 Щоб відсканувати чек:\n"
+            "• Особисто: фото з підписом `/split`, кнопка або /split, потім фото\n"
+            "• Група: фото + @snapnsplit_bot, підпис `/split` або відповідь на повідомлення бота"
+        ),
         "cancelled": "❌ Поточний чек скасовано.",
         "no_receipt": "Немає активного чеку. Спочатку надішліть фото.",
         "processing": "🔍 Сканую чек, зачекайте…",
@@ -182,17 +249,33 @@ TEXTS: dict[str, dict[str, str]] = {
         "choose_currency": "💵 Оберіть валюту:",
         "payer_not_set": "не встановлено",
         "back": "⬅️ Назад",
+        "split_mode_on": (
+            "📷 Режим розділення УВІМКНЕНО. Надішліть фото чеку зараз "
+            "(або фото з підписом `/split`)."
+        ),
+        "split_mode_off": "Режим розділення вимкнено.",
+        "photo_ignored": (
+            "Фото проігноровано. Щоб відсканувати чек використайте `/split` у підписі, "
+            "кнопку нижче або увімкніть режим командою /split."
+        ),
     },
     "RU": {
         "welcome": (
             "👋 *Бот для разделения чека*\n\n"
-            "Отправьте фото чека, и я помогу разделить счёт между друзьями.\n\n"
+            "Отправьте фото чека с подписью `/split` "
+            "(или воспользуйтесь кнопкой ниже), и я помогу разделить счёт.\n\n"
+            "В группах: упомяните @snapnsplit_bot, используйте `/split` или ответьте на сообщение бота.\n\n"
             "Команды:\n"
             "/start — это сообщение\n"
+            "/split — включить режим разделения для следующего фото (в личке)\n"
             "/cancel — отменить текущий чек\n"
             "/help — справка"
         ),
-        "help": "📷 Отправьте фото чека, чтобы начать разделение.",
+        "help": (
+            "📷 Чтобы отсканировать чек:\n"
+            "• В личке: фото с подписью `/split`, кнопка или /split, затем фото\n"
+            "• В группе: фото + @snapnsplit_bot, подпись `/split` или ответ на сообщение бота"
+        ),
         "cancelled": "❌ Текущий чек отменён.",
         "no_receipt": "Нет активного чека. Сначала отправьте фото.",
         "processing": "🔍 Сканирую чек, подождите…",
@@ -224,6 +307,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "choose_currency": "💵 Выберите валюту:",
         "payer_not_set": "не указано",
         "back": "⬅️ Назад",
+        "split_mode_on": (
+            "📷 Режим разделения ВКЛЮЧЁН. Отправьте фото чека сейчас "
+            "(или фото с подписью `/split`)."
+        ),
+        "split_mode_off": "Режим разделения выключен.",
+        "photo_ignored": (
+            "Фото проигнорировано. Чтобы отсканировать чек используйте `/split` в подписи, "
+            "кнопку ниже или включите режим командой /split."
+        ),
     },
 }
 
@@ -251,9 +343,9 @@ def remember_user(receipt: dict[str, Any], user) -> None:
 def convert_amount(amount: float, from_cur: str, to_cur: str) -> float:
     if from_cur == to_cur:
         return round(amount, 2)
-    in_pln = amount * RATES_TO_PLN.get(from_cur, 1.0)
-    rate_to = RATES_TO_PLN.get(to_cur, 1.0)
-    return round(in_pln / rate_to, 2) if rate_to else round(amount, 2)
+    in_eur = amount * RATES_TO_EUR.get(from_cur, 1.0)
+    rate_to = RATES_TO_EUR.get(to_cur, 1.0)
+    return round(in_eur / rate_to, 2) if rate_to else round(amount, 2)
 
 
 def parse_receipt_json(raw: str) -> dict[str, Any]:
@@ -278,7 +370,7 @@ def _analyze_receipt_sync(image_bytes: bytes) -> dict[str, Any]:
         "Analyze the receipt in the photo. Return STRICTLY a valid JSON object "
         "without markdown or conversational text with this structure:\n"
         "{\n"
-        '  "currency_detected": "PLN",\n'
+        '  "currency_detected": "EUR",\n'
         '  "items": [{"id": 1, "name": "Item name", "price": 100.0}],\n'
         '  "total_sum": 100.0\n'
         "}"
@@ -364,8 +456,8 @@ def compute_split(receipt: dict[str, Any]) -> tuple[dict[int, dict], float]:
 
 def build_menu_keyboard(receipt: dict[str, Any]) -> InlineKeyboardMarkup:
     lang = receipt.get("lang", "EN")
-    cur = receipt.get("currency", "PLN")
-    orig = receipt.get("original_currency", "PLN")
+    cur = receipt.get("currency", DEFAULT_CURRENCY)
+    orig = receipt.get("original_currency", DEFAULT_CURRENCY)
     tips = receipt.get("tips_percent", 0)
 
     rows: list[list[InlineKeyboardButton]] = [
@@ -411,8 +503,8 @@ def build_menu_keyboard(receipt: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def build_menu_text(receipt: dict[str, Any]) -> str:
-    orig = receipt.get("original_currency", "PLN")
-    cur = receipt.get("currency", "PLN")
+    orig = receipt.get("original_currency", DEFAULT_CURRENCY)
+    cur = receipt.get("currency", DEFAULT_CURRENCY)
     total = convert_amount(float(receipt.get("total_sum", 0)), orig, cur)
     tips = receipt.get("tips_percent", 0)
     tips_sum = round(
@@ -448,7 +540,13 @@ def build_submenu_keyboard(receipt: dict[str, Any], kind: str) -> InlineKeyboard
         rows.append(
             [
                 InlineKeyboardButton(code, callback_data=f"cur:{code}")
-                for code in SUPPORTED_CURRENCIES
+                for code in SUPPORTED_CURRENCIES[:3]
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(code, callback_data=f"cur:{code}")
+                for code in SUPPORTED_CURRENCIES[3:]
             ]
         )
     elif kind == "people":
@@ -480,10 +578,90 @@ def build_submenu_keyboard(receipt: dict[str, Any], kind: str) -> InlineKeyboard
     return InlineKeyboardMarkup(rows)
 
 
+def _reply_keyboard_for_lang(lang: str) -> ReplyKeyboardMarkup:
+    label = SPLIT_MODE_BUTTONS.get(lang, SPLIT_MODE_BUTTONS["EN"])
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label)]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def _caption_has_split(caption: str | None) -> bool:
+    if not caption:
+        return False
+    return bool(re.search(r"(?i)(?:^|\s)/split(?:@\w+)?(?:\s|$)", caption))
+
+
+def _message_mentions_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.effective_message
+    if not msg:
+        return False
+    bot_username = (context.bot.username or BOT_USERNAME).lower()
+
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    text = (msg.text or "") + "\n" + (msg.caption or "")
+    for ent in entities:
+        if ent.type == "mention":
+            mention = text[ent.offset : ent.offset + ent.length].lower()
+            if mention == f"@{bot_username}":
+                return True
+        elif ent.type == "text_mention" and ent.user and ent.user.is_bot:
+            if ent.user.id == context.bot.id:
+                return True
+    return f"@{bot_username}" in text.lower()
+
+
+def _is_reply_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.effective_message
+    if not msg or not msg.reply_to_message:
+        return False
+    replied = msg.reply_to_message
+    if replied.from_user and replied.from_user.id == context.bot.id:
+        return True
+    return False
+
+
+def should_process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return False
+
+    caption = msg.caption or ""
+
+    if _caption_has_split(caption):
+        return True
+
+    if chat.type == ChatType.PRIVATE:
+        if user.id in split_mode_users:
+            return True
+        if caption.strip() in SPLIT_MODE_BUTTON_SET:
+            return True
+        return False
+
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if _message_mentions_bot(update, context):
+            return True
+        if _is_reply_to_bot(update, context):
+            return True
+        return False
+
+    return False
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     lang = receipts.get(chat_id, {}).get("lang", "EN")
-    await update.message.reply_text(TEXTS[lang]["welcome"], parse_mode=ParseMode.MARKDOWN)
+    keyboard = None
+    if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
+        keyboard = _reply_keyboard_for_lang(lang)
+    await update.message.reply_text(
+        TEXTS[lang]["welcome"],
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -494,15 +672,77 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    user = update.effective_user
     lang = receipts.get(chat_id, {}).get("lang", "EN")
     receipts.pop(chat_id, None)
+    if user:
+        split_mode_users.discard(user.id)
     await update.message.reply_text(TEXTS[lang]["cancelled"])
+
+
+async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+
+    lang = receipts.get(chat.id, {}).get("lang", "EN")
+
+    if chat.type == ChatType.PRIVATE:
+        split_mode_users.add(user.id)
+        await update.message.reply_text(
+            TEXTS[lang]["split_mode_on"],
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_reply_keyboard_for_lang(lang),
+        )
+    else:
+        await update.message.reply_text(
+            TEXTS[lang]["help"],
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def handle_split_mode_button(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user or chat.type != ChatType.PRIVATE:
+        return
+    text = (update.message.text or "").strip()
+    if text not in SPLIT_MODE_BUTTON_SET:
+        return
+
+    lang = receipts.get(chat.id, {}).get("lang", "EN")
+    for code, label in SPLIT_MODE_BUTTONS.items():
+        if label == text:
+            lang = code
+            break
+
+    split_mode_users.add(user.id)
+    await update.message.reply_text(
+        TEXTS[lang]["split_mode_on"],
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_reply_keyboard_for_lang(lang),
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     user = update.effective_user
     lang = receipts.get(chat_id, {}).get("lang", "EN")
+
+    if not should_process_photo(update, context):
+        if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
+            await update.message.reply_text(
+                TEXTS[lang]["photo_ignored"],
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_reply_keyboard_for_lang(lang),
+            )
+        return
+
+    if user:
+        split_mode_users.discard(user.id)
 
     status = await update.message.reply_text(TEXTS[lang]["processing"])
 
@@ -513,9 +753,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await tg_file.download_to_memory(buf)
         data = await analyze_receipt_image(buf.getvalue())
 
-        detected_cur = str(data.get("currency_detected", "PLN")).upper()
+        detected_cur = str(data.get("currency_detected", DEFAULT_CURRENCY)).upper()
         if detected_cur not in SUPPORTED_CURRENCIES:
-            detected_cur = "PLN"
+            detected_cur = DEFAULT_CURRENCY
 
         items = []
         for i, raw in enumerate(data.get("items", []), start=1):
@@ -691,10 +931,23 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("split", split_command))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND
+            & filters.Regex(
+                r"^("
+                + "|".join(re.escape(b) for b in SPLIT_MODE_BUTTON_SET)
+                + r")$"
+            ),
+            handle_split_mode_button,
+        )
+    )
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Receipt Split Bot started.")
+    logger.info("Receipt Split Bot (@%s) started.", BOT_USERNAME)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
