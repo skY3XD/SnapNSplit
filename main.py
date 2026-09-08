@@ -410,8 +410,8 @@ def set_lang(chat_id: int, lang: str) -> None:
         receipts[chat_id]["lang"] = lang
 
 
-def t_lang(lang: str, key: str, **kwargs: Any) -> str:
-    text = TEXTS.get(lang, TEXTS[DEFAULT_LANG]).get(
+def t_lang(lang_code: str, key: str, **kwargs: Any) -> str:
+    text = TEXTS.get(lang_code, TEXTS[DEFAULT_LANG]).get(
         key, TEXTS[DEFAULT_LANG].get(key, key)
     )
     return text.format(**kwargs) if kwargs else text
